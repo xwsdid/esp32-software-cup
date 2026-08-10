@@ -28,6 +28,7 @@
 #include "nvs.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "sdkconfig.h"
 
 /* NimBLE */
 #include "host/ble_hs.h"
@@ -320,6 +321,22 @@ static bool has_our_service_uuid(const uint8_t *data, int len)
 static void try_connect_next(void);
 static void nvs_save_devices(void);
 static bool g_reconnect_mode = false;
+
+static void schedule_device_reconnect(int idx, const char *reason)
+{
+    if (idx < 0 || idx >= g_device_count) return;
+    device_entry_t *device = &g_devices[idx];
+    device->conn_handle = 0xFFFF;
+    device->business_cmd_handle = 0;
+    device->hello_read = false;
+    device->notify_ready = false;
+    device->retry_count++;
+    int delay_s = 2 + (device->retry_count - 1) * 2;
+    if (delay_s > 10) delay_s = 10;
+    device->reconnect_at = esp_timer_get_time() + (int64_t)delay_s * 1000000;
+    ESP_LOGW(TAG, "Device[%d] reconnect scheduled in %ds attempt=%d reason=%s",
+             idx, delay_s, device->retry_count, reason ? reason : "unknown");
+}
 
 /* BLE 事件发送 — 不阻塞 (在 NimBLE 回调上下文中, 不能长时间等待) */
 static void ble_send_event_json(const char *json)
@@ -788,8 +805,10 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         if (event->connect.status != 0) {
             ESP_LOGW(TAG, "Connect failed: status=%d idx=%d",
                      event->connect.status, g_pending_idx);
-            /* 连接失败 → 尝试下一个 */
-            if (g_pending_idx >= 0) g_pending_idx++;
+            if (g_pending_idx >= 0) {
+                schedule_device_reconnect(g_pending_idx, "gap_connect_failed");
+                g_pending_idx++;
+            }
             try_connect_next();
             break;
         }
@@ -803,6 +822,8 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             if (memcmp(g_devices[i].addr, desc.peer_ota_addr.val, 6) == 0) {
                 g_devices[i].conn_handle = ch;
                 g_devices[i].notify_ready = false;
+                g_devices[i].retry_count = 0;
+                g_devices[i].reconnect_at = 0;
                 ESP_LOGI(TAG, "Connected: idx=%d name=%s handle=%d", i,
                          g_devices[i].name, ch);
 
@@ -888,9 +909,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
                     "\"address\":\"%s\",\"connected\":false}",
                     g_scan_seq, g_devices[i].device_id[0] ? g_devices[i].device_id : addr_str, addr_str);
                 ble_send_event_json(st);
-                /* 标记自动重连: 2s 后重试 */
-                g_devices[i].reconnect_at = esp_timer_get_time() + 2000000;
-                ESP_LOGI(TAG, "Device[%d] offline, auto-reconnect in 2s", i);
+                schedule_device_reconnect(i, "disconnected");
                 break;
             }
         }
@@ -962,6 +981,7 @@ static void try_connect_next(void)
                                  ble_gap_event_cb, NULL);
         if (rc == 0) return;  /* 异步等待 connect 结果 */
         ESP_LOGW(TAG, "ble_gap_connect failed: rc=%d idx=%d", rc, i);
+        schedule_device_reconnect(i, "connect_start_failed");
         g_pending_idx++;
     }
 
@@ -1499,6 +1519,8 @@ void app_main(void)
     ESP_LOGI(TAG, "============================================");
     ESP_LOGI(TAG, "ESP32-S3 USB BLE Gateway — Stage 2");
     ESP_LOGI(TAG, "USB: 0x01/0x81, BLE: NimBLE Central");
+    ESP_LOGI(TAG, "BLE capacity: host_connections=%d controller_activities=%d",
+             CONFIG_BT_NIMBLE_MAX_CONNECTIONS, CONFIG_BT_CTRL_BLE_MAX_ACT);
     ESP_LOGI(TAG, "usb_connected=%d", usb_serial_jtag_is_connected());
     ESP_LOGI(TAG, "============================================");
 
