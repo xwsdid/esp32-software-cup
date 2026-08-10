@@ -150,7 +150,6 @@ static void handle_plain_cmd(const char *json, bool use_aes)
 
 /* ---- BLE 传感器主动上报 ---- */
 static int g_ble_sensor_seq = 0;
-static int g_ble_event_seq = 0;  /* 每个 BLE 事件独立递增, 供大禹追踪 */
 static int64_t g_ble_sensor_suppress_until = 0;  /* 协商后 3s 内不上报, 让 ACK 先出去 */
 
 void ble_bridge_report_sensor(float temp, float hum, int pir, float lux)
@@ -239,26 +238,20 @@ bool ble_bridge_on_command(const uint8_t *data, uint16_t len)
         /* 暂停周期上报 5s, 让公钥和 ACK 独占通道 */
         g_ble_sensor_suppress_until = esp_timer_get_time() + 5000000;
 
-        /* 发送外设公钥 (重发 3 次, 间隔 300ms) */
+        /* Notify 队列负责真实的帧间隔；GATT 回调中不能阻塞 NimBLE。 */
         char pk_b64[180]; ble_crypto_get_pubkey_b64(pk_b64, sizeof(pk_b64));
         char resp[400];
-        int ev_seq = ++g_ble_event_seq;
         snprintf(resp, sizeof(resp),
             "{\"type\":\"ble_key_exchange\",\"action\":\"public-key\","
-            "\"deviceId\":\"%s\",\"epoch\":%d,\"eventSeq\":%d,\"publicKeyBase64\":\"%s\"}",
-            s_device_id, epoch, ev_seq, pk_b64);
-        for (int r = 0; r < 3; r++) {
-            send_notify_text(resp);
-            ESP_LOGI(TAG, "[BLE-ECDH] sent public key retry %d/3 (epoch=%d)", r+1, epoch);
-            if (r < 2) vTaskDelay(pdMS_TO_TICKS(300));
-        }
+            "\"epoch\":%d,\"publicKeyBase64\":\"%s\"}", epoch, pk_b64);
+        send_notify_text(resp);
+        ESP_LOGI(TAG, "[BLE-ECDH] queued public key (epoch=%d)", epoch);
 
-        /* 激活 + 加密确认 (重发 3 次) */
+        /* 激活并排队一份紧凑确认，避免重复公钥扰乱对端状态机。 */
         ble_crypto_activate();
         char ack[200];
-        int key_ev_seq = ++g_ble_event_seq;
         int alen = snprintf(ack, sizeof(ack),
-            "{\"type\":\"ack\",\"cmd\":\"key\",\"ok\":true,\"transport\":\"ble\",\"epoch\":%d,\"eventSeq\":%d}", epoch, key_ev_seq);
+            "{\"type\":\"ack\",\"cmd\":\"key\",\"ok\":true,\"epoch\":%d}", epoch);
         uint8_t enc[512];
         int elen = ble_crypto_encrypt((const uint8_t *)ack, (size_t)alen, enc, sizeof(enc));
         if (elen > 0) {
@@ -278,11 +271,8 @@ bool ble_bridge_on_command(const uint8_t *data, uint16_t len)
             snprintf(secure, sizeof(secure),
                 "{\"type\":\"ble_secure\",\"version\":1,\"crypto\":\"SM4\","
                 "\"epoch\":%d,\"payloadBase64\":\"%s\"}", epoch, b64_out);
-            for (int r = 0; r < 3; r++) {
-                send_notify_text(secure);
-                ESP_LOGI(TAG, "[BLE-ECDH] sent key ACK retry %d/3 (epoch=%d)", r+1, epoch);
-                if (r < 2) vTaskDelay(pdMS_TO_TICKS(300));
-            }
+            send_notify_text(secure);
+            ESP_LOGI(TAG, "[BLE-ECDH] queued key ACK (epoch=%d len=%d)", epoch, (int)strlen(secure));
         }
         ESP_LOGI(TAG, "[BLE-ECDH] key exchange done epoch=%d", epoch);
         return true;

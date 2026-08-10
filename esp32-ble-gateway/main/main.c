@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
@@ -47,6 +48,7 @@ static const char *TAG = "GW";
 
 static QueueHandle_t g_evt_queue = NULL;  /* BLE 事件 → 主循环 发送队列 */
 typedef struct { char *data; int len; } evt_item_t;
+static SemaphoreHandle_t g_usb_tx_mutex = NULL;
 
 /* ======================== 帧协议常量 ======================== */
 #define FRAME_SYNC1         0xAA
@@ -101,10 +103,15 @@ static int build_frame(uint8_t *buf, size_t buf_size,
 static void usb_send_frame_simple(uint8_t type, uint8_t seq,
                                   const uint8_t *payload, uint16_t payload_len)
 {
+    if (g_usb_tx_mutex && xSemaphoreTake(g_usb_tx_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "USB TX mutex timeout type=0x%02X seq=%d", type, seq);
+        return;
+    }
     uint8_t buf[FRAME_MAX_PAYLOAD + 16];
     int frame_len = build_frame(buf, sizeof(buf), type, seq, payload, payload_len);
     if (frame_len <= 0) {
         ESP_LOGE(TAG, "USB BUILD FAIL");
+        if (g_usb_tx_mutex) xSemaphoreGive(g_usb_tx_mutex);
         return;
     }
     /* 分片写入: usb_serial_jtag_write_bytes 对大帧不稳定, 64B chunks */
@@ -116,17 +123,20 @@ static void usb_send_frame_simple(uint8_t type, uint8_t seq,
         if (wr <= 0) {
             ESP_LOGE(TAG, "USB TX FAIL type=0x%02X seq=%d len=%d at %d/%d: %d",
                      type, seq, frame_len, off, frame_len, wr);
+            if (g_usb_tx_mutex) xSemaphoreGive(g_usb_tx_mutex);
             return;
         }
         off += wr; total += wr;
     }
     if (total != frame_len) {
         ESP_LOGE(TAG, "USB TX partial type=0x%02X seq=%d: %d/%d", type, seq, total, frame_len);
+        if (g_usb_tx_mutex) xSemaphoreGive(g_usb_tx_mutex);
         return;
     }
     esp_err_t tx = usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(3000));
     if (tx != ESP_OK) ESP_LOGW(TAG, "USB FLUSH TIMEOUT type=0x%02X seq=%d", type, seq);
     ESP_LOGI(TAG, "USB TX OK type=0x%02X seq=%d len=%d", type, seq, frame_len);
+    if (g_usb_tx_mutex) xSemaphoreGive(g_usb_tx_mutex);
     vTaskDelay(pdMS_TO_TICKS(100));  /* 帧间隔: 大禹需要时间解析每帧 */
 }
 
@@ -269,6 +279,7 @@ typedef struct {
     uint16_t conn_handle;
     uint16_t business_cmd_handle;  /* 写入 business_cmd 用的 handle */
     bool     hello_read;
+    bool     notify_ready;
     int      retry_count;     /* GATT 超时重试计数, 超过 3 次放弃 */
     int64_t  reconnect_at;    /* 断连后自动重连时间戳 (0=无需重连) */
     char     device_id[32]; char capabilities[128]; char room[16];
@@ -341,6 +352,18 @@ static void ble_send_event_json(const char *json)
     }
 }
 
+static void usb_event_tx_task(void *arg)
+{
+    evt_item_t item;
+    while (1) {
+        if (xQueueReceive(g_evt_queue, &item, portMAX_DELAY) == pdTRUE) {
+            usb_send_json(TYPE_GATEWAY_BLE_EVT, (uint8_t)g_scan_seq, item.data);
+            ESP_LOGI(TAG, "BLE EVT: %s", item.data);
+            free(item.data);
+        }
+    }
+}
+
 /* 在设备列表中添加/查找 */
 static int find_device_by_addr(const uint8_t *addr)
 {
@@ -361,6 +384,7 @@ static int add_device(const uint8_t *addr, uint8_t addr_type, const char *name, 
     g_devices[idx].rssi = rssi;
     g_devices[idx].conn_handle = 0xFFFF;
     g_devices[idx].hello_read = false;
+    g_devices[idx].notify_ready = false;
     g_devices[idx].device_id[0] = '\0';
     g_devices[idx].capabilities[0] = '\0';
     g_devices[idx].room[0] = '\0';
@@ -369,19 +393,95 @@ static int add_device(const uint8_t *addr, uint8_t addr_type, const char *name, 
 
 /* ---- GATT 读取回调 (级联) ---- */
 
-struct hello_read_ctx { uint16_t conn_handle; uint16_t event_handle; uint16_t cmd_handle; uint8_t addr[6]; bool consumed; };
+struct hello_read_ctx {
+    uint16_t conn_handle;
+    uint16_t hello_handle;
+    uint16_t event_handle;
+    uint16_t cmd_handle;
+    uint16_t service_start_handle;
+    uint16_t service_end_handle;
+    uint8_t addr[6];
+    bool service_found;
+};
+
+struct subscribe_ctx { int idx; uint16_t conn_handle; };
+
+static void report_device_ready(int idx)
+{
+    if (idx < 0 || idx >= g_device_count) return;
+    char addr_str[18];
+    snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             g_devices[idx].addr[5], g_devices[idx].addr[4], g_devices[idx].addr[3],
+             g_devices[idx].addr[2], g_devices[idx].addr[1], g_devices[idx].addr[0]);
+
+    char hello[600];
+    snprintf(hello, sizeof(hello),
+        "{\"type\":\"device_hello\",\"seq\":%d,\"deviceId\":\"%s\",\"name\":\"%s\","
+        "\"room\":\"%s\",\"address\":\"%s\",\"rssi\":%d,\"connected\":true,"
+        "\"capabilities\":%s,\"transport\":\"ble\",\"crypto\":\"sm4\",\"epoch\":0}",
+        g_scan_seq, g_devices[idx].device_id, g_devices[idx].name, g_devices[idx].room,
+        addr_str, g_devices[idx].rssi,
+        g_devices[idx].capabilities[0] ? g_devices[idx].capabilities : "[]");
+    ble_send_event_json(hello);
+
+    char state[300];
+    snprintf(state, sizeof(state),
+        "{\"type\":\"ble_device_state\",\"seq\":%d,\"deviceId\":\"%s\","
+        "\"address\":\"%s\",\"connected\":true}",
+        g_scan_seq, g_devices[idx].device_id, addr_str);
+    ble_send_event_json(state);
+
+    char ready[320];
+    snprintf(ready, sizeof(ready),
+        "{\"type\":\"ble_ready\",\"seq\":%d,\"deviceId\":\"%s\","
+        "\"address\":\"%s\",\"connected\":true,\"notifyReady\":true}",
+        g_scan_seq, g_devices[idx].device_id, addr_str);
+    ble_send_event_json(ready);
+}
+
+static void finish_device_setup(int idx, bool ready)
+{
+    if (idx >= 0 && idx < g_device_count) {
+        g_devices[idx].notify_ready = ready;
+        if (ready) {
+            g_hello_done++;
+            report_device_ready(idx);
+            ESP_LOGI(TAG, "BLE ready: idx=%d device=%s", idx, g_devices[idx].device_id);
+        } else {
+            ESP_LOGW(TAG, "BLE notify setup failed: idx=%d", idx);
+            g_devices[idx].business_cmd_handle = 0;
+            g_devices[idx].hello_read = false;
+            if (g_devices[idx].conn_handle != 0xFFFF) {
+                ble_gap_terminate(g_devices[idx].conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+        }
+    }
+    if (g_pending_idx >= 0) g_pending_idx++;
+    try_connect_next();
+}
+
+static int ble_subscribe_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr, void *arg)
+{
+    struct subscribe_ctx *ctx = (struct subscribe_ctx *)arg;
+    bool ok = error && error->status == 0;
+    int idx = ctx ? ctx->idx : -1;
+    ESP_LOGI(TAG, "Subscribe complete: conn=%d idx=%d status=%d",
+             conn_handle, idx, error ? error->status : -1);
+    free(ctx);
+    finish_device_setup(idx, ok);
+    return 0;
+}
 
 static int ble_hello_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                              struct ble_gatt_attr *attr, void *arg)
 {
     struct hello_read_ctx *ctx = (struct hello_read_ctx *)arg;
-    if (ctx->consumed) return 0;
-
     int idx = find_device_by_addr(ctx->addr);
     if (error->status != 0 || attr == NULL) {
         ESP_LOGW(TAG, "GATT read err: conn=%d status=%d", conn_handle, error->status);
-        ctx->consumed = true;
         free(ctx);
+        finish_device_setup(idx, false);
         /* watchdog 兜底超时, 不在这里 disconnect */
         return 0;
     }
@@ -391,7 +491,12 @@ static int ble_hello_read_cb(uint16_t conn_handle, const struct ble_gatt_error *
     char json[512];
     uint16_t out_len = 0;
     int rc = ble_hs_mbuf_to_flat(attr->om, json, sizeof(json) - 1, &out_len);
-    if (rc != 0 || out_len == 0) { ESP_LOGW(TAG, "mbuf_to_flat failed: rc=%d", rc); return 0; }
+    if (rc != 0 || out_len == 0) {
+        ESP_LOGW(TAG, "mbuf_to_flat failed: rc=%d", rc);
+        free(ctx);
+        finish_device_setup(idx, false);
+        return 0;
+    }
     json[out_len] = '\0';
     ESP_LOGI(TAG, "device_hello read: conn=%d total=%u data=%s", conn_handle, total_len, json);
 
@@ -414,62 +519,51 @@ static int ble_hello_read_cb(uint16_t conn_handle, const struct ble_gatt_error *
     }
     json_get_str(json, "room", rm, sizeof(rm));
 
-    /* 构建上报 JSON: deviceId 用 hello 里的值, address 用 BLE MAC */
-    char addr_str[18];
-    snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-             ctx->addr[5], ctx->addr[4], ctx->addr[3], ctx->addr[2], ctx->addr[1], ctx->addr[0]);
-
-    char evt[600];
-    snprintf(evt, sizeof(evt),
-        "{\"type\":\"device_hello\",\"seq\":%d,"
-        "\"deviceId\":\"%s\",\"name\":\"%s\",\"room\":\"%s\","
-        "\"address\":\"%s\",\"rssi\":%d,\"connected\":true,"
-        "\"capabilities\":%s,\"transport\":\"ble\",\"crypto\":\"sm4\",\"epoch\":0}",
-        g_scan_seq, did[0] ? did : "unknown", nm[0] ? nm : "unknown", rm,
-        addr_str, idx >= 0 ? g_devices[idx].rssi : -100,
-        caps[0] ? caps : "[]");
-    ble_send_event_json(evt);
-
-    /* 同时上报 ble_device_state connected=true */
-    char st_evt[300];
-    snprintf(st_evt, sizeof(st_evt),
-        "{\"type\":\"ble_device_state\",\"seq\":%d,\"deviceId\":\"%s\","
-        "\"address\":\"%s\",\"connected\":true}",
-        g_scan_seq, did[0] ? did : addr_str, addr_str);
-    ble_send_event_json(st_evt);
+    if (idx < 0 || did[0] == '\0') {
+        ESP_LOGW(TAG, "device_hello missing stable deviceId");
+        free(ctx);
+        finish_device_setup(idx, false);
+        return 0;
+    }
 
     if (idx >= 0) {
         g_devices[idx].hello_read = true;
+        g_devices[idx].notify_ready = false;
         g_devices[idx].business_cmd_handle = ctx->cmd_handle;
-        g_hello_done++;
         snprintf(g_devices[idx].device_id, sizeof(g_devices[idx].device_id), "%s", did);
+        snprintf(g_devices[idx].name, sizeof(g_devices[idx].name), "%s", nm[0] ? nm : "unknown");
+        snprintf(g_devices[idx].room, sizeof(g_devices[idx].room), "%s", rm);
         snprintf(g_devices[idx].capabilities, sizeof(g_devices[idx].capabilities), "%s", caps);
         nvs_save_devices();  /* 首次读到 hello 时持久化到 NVS */
     }
 
-    ctx->consumed = true;  /* 阻止后续 chr_disc 回调重复读取 */
+    uint16_t event_handle = ctx->event_handle;
+    free(ctx);
 
-    /* 订阅 device_event Notify (CCCD = event_handle + 1, 值 0x0100 = notifications) */
-    if (ctx->event_handle != 0) {
-        uint16_t cccd_handle = ctx->event_handle + 1;
-        uint16_t cccd_val = 0x0001;  /* notifications enabled */
+    /* Only report ready after the peripheral confirms the CCCD write. */
+    if (event_handle != 0) {
+        uint16_t cccd_handle = event_handle + 1;
+        uint16_t cccd_val = 0x0001;
+        struct subscribe_ctx *sub_ctx = calloc(1, sizeof(*sub_ctx));
+        if (!sub_ctx) {
+            finish_device_setup(idx, false);
+            return 0;
+        }
+        sub_ctx->idx = idx;
+        sub_ctx->conn_handle = conn_handle;
         int sub_rc = ble_gattc_write_flat(conn_handle, cccd_handle,
-                                          &cccd_val, sizeof(cccd_val), NULL, NULL);
+                                           &cccd_val, sizeof(cccd_val), ble_subscribe_cb, sub_ctx);
         if (sub_rc != 0) {
             ESP_LOGW(TAG, "Subscribe device_event failed: rc=%d", sub_rc);
+            free(sub_ctx);
+            finish_device_setup(idx, false);
         } else {
-            ESP_LOGI(TAG, "Subscribed to device_event on conn=%d", conn_handle);
+            ESP_LOGI(TAG, "Subscribe requested on conn=%d; waiting completion", conn_handle);
         }
+    } else {
+        finish_device_setup(idx, false);
     }
 
-    /* 连接下一个设备 */
-    if (g_pending_idx >= 0) g_pending_idx++;
-    try_connect_next();
-
-    /* 注意: ctx 这里不 free!
-     * disc_all_chrs 后续回调(chr==NULL/error)还会带这个 ctx 触发,
-     * free 了反而 use-after-free crash. consumed=true 让后续回调直接跳过.
-     * 每个设备泄漏 14 字节, 可忽略. */
     return 0;
 }
 
@@ -478,18 +572,34 @@ static int ble_chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *er
                            const struct ble_gatt_chr *chr, void *arg)
 {
     struct hello_read_ctx *ctx = (struct hello_read_ctx *)arg;
-    if (ctx->consumed) return 0;
-
-    if (error->status != 0) {
-        ESP_LOGW(TAG, "CHR DISC ERR: conn=%d status=%d (ignored)", conn_handle, error->status);
+    if (error->status == BLE_HS_EDONE) {
+        if (ctx->hello_handle == 0 || ctx->event_handle == 0 || ctx->cmd_handle == 0) {
+            int idx = find_device_by_addr(ctx->addr);
+            ESP_LOGW(TAG, "GATT characteristics incomplete: hello=%d event=%d cmd=%d",
+                     ctx->hello_handle, ctx->event_handle, ctx->cmd_handle);
+            free(ctx);
+            finish_device_setup(idx, false);
+            return 0;
+        }
+        int rc = ble_gattc_read(conn_handle, ctx->hello_handle, ble_hello_read_cb, ctx);
+        if (rc != 0) {
+            int idx = find_device_by_addr(ctx->addr);
+            ESP_LOGW(TAG, "device_hello read start failed: rc=%d", rc);
+            free(ctx);
+            finish_device_setup(idx, false);
+        }
         return 0;
     }
-    if (chr == NULL) {
+    if (error->status != 0 || chr == NULL) {
+        int idx = find_device_by_addr(ctx->addr);
+        ESP_LOGW(TAG, "CHR DISC ERR: conn=%d status=%d", conn_handle, error->status);
+        free(ctx);
+        finish_device_setup(idx, false);
         return 0;
     }
     if (memcmp(&chr->uuid, &CHAR_HELLO_UUID, sizeof(ble_uuid128_t)) == 0) {
         ESP_LOGI(TAG, "Found device_hello char, handle=%d", chr->val_handle);
-        ble_gattc_read(conn_handle, chr->val_handle, ble_hello_read_cb, ctx);
+        ctx->hello_handle = chr->val_handle;
         return 0;
     }
     if (memcmp(&chr->uuid, &CHAR_EVENT_UUID, sizeof(ble_uuid128_t)) == 0) {
@@ -511,12 +621,32 @@ static int ble_svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *er
 {
     struct hello_read_ctx *ctx = (struct hello_read_ctx *)arg;
 
-    if (error->status != 0) {
-        ESP_LOGW(TAG, "SVC DISC ERR: conn=%d status=%d (ignored)", conn_handle, error->status);
+    if (error->status == BLE_HS_EDONE) {
+        if (ctx->service_found) {
+            int rc = ble_gattc_disc_all_chrs(conn_handle,
+                                             ctx->service_start_handle,
+                                             ctx->service_end_handle,
+                                             ble_chr_disc_cb, ctx);
+            if (rc != 0) {
+                int idx = find_device_by_addr(ctx->addr);
+                ESP_LOGW(TAG, "Characteristic discovery start failed: rc=%d", rc);
+                free(ctx);
+                finish_device_setup(idx, false);
+            }
+        } else {
+            int idx = find_device_by_addr(ctx->addr);
+            ESP_LOGW(TAG, "Gateway Service not found: conn=%d", conn_handle);
+            free(ctx);
+            finish_device_setup(idx, false);
+        }
         return 0;
     }
-    if (svc == NULL) {
-        return 0;  /* ctx 归 chr_disc 或 hello_read 释放 */
+    if (error->status != 0 || svc == NULL) {
+        int idx = find_device_by_addr(ctx->addr);
+        ESP_LOGW(TAG, "SVC DISC ERR: conn=%d status=%d", conn_handle, error->status);
+        free(ctx);
+        finish_device_setup(idx, false);
+        return 0;
     }
     /* 打印每个发现的 service UUID 前 8 字节用于诊断 */
     ESP_LOGI(TAG, "SVC DISC: conn=%d uuid_type=%d uuid_start=%02X%02X%02X%02X%02X%02X%02X%02X",
@@ -526,12 +656,34 @@ static int ble_svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *er
              ((const uint8_t*)&svc->uuid)[5], ((const uint8_t*)&svc->uuid)[6],
              ((const uint8_t*)&svc->uuid)[7]);
     if (memcmp(&svc->uuid, &GATT_SVC_UUID, sizeof(ble_uuid128_t)) == 0) {
+        ctx->service_found = true;
+        ctx->service_start_handle = svc->start_handle;
+        ctx->service_end_handle = svc->end_handle;
         ESP_LOGI(TAG, "Found Gateway Service, conn=%d start=%d end=%d",
                  conn_handle, svc->start_handle, svc->end_handle);
-        ble_gattc_disc_all_chrs(conn_handle, svc->start_handle, svc->end_handle,
-                                ble_chr_disc_cb, ctx);
-        return 0;
     }
+    return 0;
+}
+
+static void start_service_discovery(struct hello_read_ctx *ctx)
+{
+    int idx = find_device_by_addr(ctx->addr);
+    int rc = ble_gattc_disc_svc_by_uuid(ctx->conn_handle, &GATT_SVC_UUID.u,
+                                        ble_svc_disc_cb, ctx);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Service discovery start failed: rc=%d idx=%d", rc, idx);
+        free(ctx);
+        finish_device_setup(idx, false);
+    }
+}
+
+static int ble_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                      uint16_t mtu, void *arg)
+{
+    struct hello_read_ctx *ctx = (struct hello_read_ctx *)arg;
+    ESP_LOGI(TAG, "MTU exchange complete: conn=%d mtu=%d status=%d",
+             conn_handle, mtu, error ? error->status : -1);
+    start_service_discovery(ctx);
     return 0;
 }
 
@@ -650,38 +802,21 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         for (int i = 0; i < g_device_count; i++) {
             if (memcmp(g_devices[i].addr, desc.peer_ota_addr.val, 6) == 0) {
                 g_devices[i].conn_handle = ch;
+                g_devices[i].notify_ready = false;
                 ESP_LOGI(TAG, "Connected: idx=%d name=%s handle=%d", i,
                          g_devices[i].name, ch);
 
-                /* 交换 MTU, 确保 device_hello 大 JSON (~170B) 能一次读完 */
-                int mtu_rc = ble_gattc_exchange_mtu(ch, NULL, NULL);
-                if (mtu_rc != 0) ESP_LOGW(TAG, "MTU exchange failed: rc=%d", mtu_rc);
-
-                /* 上报 ble_device_state connected=true */
-                char addr_str[18];
-                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                         desc.peer_ota_addr.val[5], desc.peer_ota_addr.val[4],
-                         desc.peer_ota_addr.val[3], desc.peer_ota_addr.val[2],
-                         desc.peer_ota_addr.val[1], desc.peer_ota_addr.val[0]);
-
-                char evt[300];
-                snprintf(evt, sizeof(evt),
-                    "{\"type\":\"ble_device_state\",\"seq\":%d,\"deviceId\":\"%s\","
-                    "\"address\":\"%s\",\"connected\":true}",
-                    g_scan_seq, addr_str, addr_str);
-                ble_send_event_json(evt);
-
-                /* 等 3 秒让外设完全断 WiFi, 再发起 GATT */
-                vTaskDelay(pdMS_TO_TICKS(3000));
                 struct hello_read_ctx *ctx = calloc(1, sizeof(*ctx));
                 if (ctx) {
                     ctx->conn_handle = ch;
-                    ctx->event_handle = 0;
-                    ctx->cmd_handle = 0;
                     memcpy(ctx->addr, g_devices[i].addr, 6);
-                    ctx->consumed = false;
-                    ble_gattc_disc_svc_by_uuid(ch, &GATT_SVC_UUID.u,
-                                               ble_svc_disc_cb, ctx);
+                    int mtu_rc = ble_gattc_exchange_mtu(ch, ble_mtu_cb, ctx);
+                    if (mtu_rc != 0) {
+                        ESP_LOGW(TAG, "MTU exchange start failed: rc=%d; continuing discovery", mtu_rc);
+                        start_service_discovery(ctx);
+                    }
+                } else {
+                    finish_device_setup(i, false);
                 }
                 break;
             }
@@ -739,6 +874,9 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         for (int i = 0; i < g_device_count; i++) {
             if (g_devices[i].conn_handle == event->disconnect.conn.conn_handle) {
                 g_devices[i].conn_handle = 0xFFFF;
+                g_devices[i].business_cmd_handle = 0;
+                g_devices[i].hello_read = false;
+                g_devices[i].notify_ready = false;
                 /* 上报离线 + 标记自动重连 */
                 char addr_str[18];
                 snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -765,6 +903,20 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
 }
 
 /* ---- 顺序连接: 从 g_pending_idx 开始连接下一个设备 ---- */
+static int count_ready_devices(void)
+{
+    int count = 0;
+    for (int i = 0; i < g_device_count; i++) {
+        if (!g_devices[i].notify_ready || g_devices[i].business_cmd_handle == 0 ||
+            g_devices[i].conn_handle == 0xFFFF) {
+            continue;
+        }
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(g_devices[i].conn_handle, &desc) == 0) count++;
+    }
+    return count;
+}
+
 static void try_connect_next(void)
 {
     while (g_pending_idx >= 0 && g_pending_idx < g_device_count) {
@@ -774,7 +926,27 @@ static void try_connect_next(void)
             /* 连接还在, 确认是否真的有效 */
             struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(g_devices[i].conn_handle, &desc) == 0) {
-                g_hello_done++;  /* 已连接有效, 计入完成数 */
+                if (!g_devices[i].notify_ready || g_devices[i].business_cmd_handle == 0) {
+                    struct hello_read_ctx *ctx = calloc(1, sizeof(*ctx));
+                    if (!ctx) {
+                        ESP_LOGE(TAG, "GATT setup context allocation failed: idx=%d", i);
+                        g_pending_idx++;
+                        continue;
+                    }
+                    ctx->conn_handle = g_devices[i].conn_handle;
+                    memcpy(ctx->addr, g_devices[i].addr, 6);
+                    ESP_LOGI(TAG, "Refreshing GATT setup for connected device idx=%d", i);
+                    int rc = ble_gattc_disc_svc_by_uuid(g_devices[i].conn_handle,
+                                                        &GATT_SVC_UUID.u,
+                                                        ble_svc_disc_cb, ctx);
+                    if (rc == 0) return;
+                    ESP_LOGW(TAG, "GATT setup refresh failed: rc=%d idx=%d", rc, i);
+                    free(ctx);
+                    g_pending_idx++;
+                    continue;
+                }
+                g_hello_done++;
+                report_device_ready(i);
                 g_pending_idx++;
                 continue;
             }
@@ -795,22 +967,24 @@ static void try_connect_next(void)
 
     /* 所有设备处理完毕 → 发完成事件 */
     if (g_scan_done || g_reconnect_mode) {
-        if (g_reconnect_mode) {
+        int ready_count = count_ready_devices();
+        bool reconnect_completion = g_reconnect_mode;
+        if (reconnect_completion) {
             char evt[200];
             snprintf(evt, sizeof(evt),
                 "{\"type\":\"ble_reconnect_finished\",\"seq\":%d,\"ok\":true,\"count\":%d,\"reason\":\"completed\"}",
-                g_scan_seq, g_hello_done);
+                g_scan_seq, ready_count);
             ble_send_event_json(evt);
             g_reconnect_mode = false;
         } else {
             char evt[200];
             snprintf(evt, sizeof(evt),
                 "{\"type\":\"ble_scan_finished\",\"seq\":%d,\"ok\":true,\"count\":%d,\"reason\":\"completed\"}",
-                g_scan_seq, g_hello_done);
+                g_scan_seq, ready_count);
             ble_send_event_json(evt);
         }
-        ESP_LOGI(TAG, "All done: %d devices hello read (%s)", g_hello_done,
-                 g_reconnect_mode ? "reconnect" : "scan");
+        ESP_LOGI(TAG, "All done: %d/%d devices ready (%s)", ready_count, g_device_count,
+                 reconnect_completion ? "reconnect" : "scan");
         g_pending_idx = -1;
         g_busy = false;
     }
@@ -869,7 +1043,6 @@ static void ble_scan_start(int duration_ms, int max_devices, bool auto_connect)
 
     /* 跨扫描累积设备: 保留已有连接, 重置扫描相关状态 */
     for (int i = 0; i < g_device_count; i++) {
-        g_devices[i].hello_read = false;
         g_devices[i].retry_count = 0;
     }
     g_hello_done = 0;
@@ -962,19 +1135,26 @@ static void handle_connect_known(uint8_t seq)
     g_scan_seq = seq;
     g_reconnect_mode = true;
 
-    /* 先保存当前连接句柄 (NVS load 会清零), 再按地址恢复 */
-    uint16_t saved_handles[MAX_DEVICES];
-    for (int i = 0; i < g_device_count; i++) saved_handles[i] = g_devices[i].conn_handle;
+    /* NVS only stores identity. Preserve live GATT state and restore it by MAC. */
+    static device_entry_t saved_devices[MAX_DEVICES];
+    int saved_count = g_device_count;
+    memcpy(saved_devices, g_devices, sizeof(saved_devices));
 
     int loaded = nvs_load_devices();
 
-    /* 恢复已有连接句柄 (NVS load 重置了 conn_handle=0xFFFF) */
-    for (int i = 0; i < loaded && i < g_device_count; i++) {
-        if (saved_handles[i] != 0xFFFF) {
-            struct ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(saved_handles[i], &desc) == 0 &&
-                memcmp(desc.peer_ota_addr.val, g_devices[i].addr, 6) == 0) {
-                g_devices[i].conn_handle = saved_handles[i];
+    for (int i = 0; i < loaded; i++) {
+        for (int j = 0; j < saved_count; j++) {
+            if (memcmp(saved_devices[j].addr, g_devices[i].addr, 6) == 0 &&
+                saved_devices[j].conn_handle != 0xFFFF) {
+                struct ble_gap_conn_desc desc;
+                if (ble_gap_conn_find(saved_devices[j].conn_handle, &desc) == 0 &&
+                    memcmp(desc.peer_ota_addr.val, g_devices[i].addr, 6) == 0) {
+                    g_devices[i].conn_handle = saved_devices[j].conn_handle;
+                    g_devices[i].business_cmd_handle = saved_devices[j].business_cmd_handle;
+                    g_devices[i].hello_read = saved_devices[j].hello_read;
+                    g_devices[i].notify_ready = saved_devices[j].notify_ready;
+                }
+                break;
             }
         }
     }
@@ -993,8 +1173,14 @@ static void handle_connect_known(uint8_t seq)
     for (int i = 0; i < g_device_count; i++) {
         if (g_devices[i].conn_handle != 0xFFFF) {
             struct ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(g_devices[i].conn_handle, &desc) == 0) alive_count++;
-            else g_devices[i].conn_handle = 0xFFFF;
+            if (ble_gap_conn_find(g_devices[i].conn_handle, &desc) == 0 &&
+                g_devices[i].notify_ready && g_devices[i].business_cmd_handle != 0) {
+                alive_count++;
+            } else if (ble_gap_conn_find(g_devices[i].conn_handle, &desc) != 0) {
+                g_devices[i].conn_handle = 0xFFFF;
+                g_devices[i].business_cmd_handle = 0;
+                g_devices[i].notify_ready = false;
+            }
         }
     }
 
@@ -1009,7 +1195,9 @@ static void handle_connect_known(uint8_t seq)
                  g_devices[i].addr[5], g_devices[i].addr[4], g_devices[i].addr[3],
                  g_devices[i].addr[2], g_devices[i].addr[1], g_devices[i].addr[0]);
 
-        bool alive = (g_devices[i].conn_handle != 0xFFFF);
+        bool alive = (g_devices[i].conn_handle != 0xFFFF &&
+                      g_devices[i].notify_ready &&
+                      g_devices[i].business_cmd_handle != 0);
         bool has_id = (g_devices[i].device_id[0] != '\0');
 
         char evt[500];
@@ -1042,6 +1230,14 @@ static void handle_connect_known(uint8_t seq)
                 "\"address\":\"%s\",\"connected\":%s}",
                 seq, g_devices[i].device_id, addr_str, alive ? "true" : "false");
             ble_send_event_json(st);
+            if (alive) {
+                char ready[320];
+                snprintf(ready, sizeof(ready),
+                    "{\"type\":\"ble_ready\",\"seq\":%d,\"deviceId\":\"%s\","
+                    "\"address\":\"%s\",\"connected\":true,\"notifyReady\":true}",
+                    seq, g_devices[i].device_id, addr_str);
+                ble_send_event_json(ready);
+            }
         }
     }
 
@@ -1164,13 +1360,25 @@ static void handle_ble_command(uint8_t seq, const uint8_t *payload, uint16_t pay
                      g_devices[i].addr[5], g_devices[i].addr[4], g_devices[i].addr[3],
                      g_devices[i].addr[2], g_devices[i].addr[1], g_devices[i].addr[0]);
             bool cached = (g_devices[i].device_id[0] != '\0');
+            bool ready = false;
+            if (g_devices[i].conn_handle != 0xFFFF &&
+                g_devices[i].notify_ready &&
+                g_devices[i].business_cmd_handle != 0) {
+                struct ble_gap_conn_desc desc;
+                ready = ble_gap_conn_find(g_devices[i].conn_handle, &desc) == 0;
+                if (!ready) {
+                    g_devices[i].conn_handle = 0xFFFF;
+                    g_devices[i].business_cmd_handle = 0;
+                    g_devices[i].notify_ready = false;
+                }
+            }
             char evt[500];
             snprintf(evt, sizeof(evt),
                 "{\"type\":\"ble_device\",\"seq\":%d,\"deviceId\":\"%s\",\"name\":\"%s\","
-                "\"address\":\"%s\",\"rssi\":%d,\"connected\":false,\"capabilities\":%s}",
+                "\"address\":\"%s\",\"rssi\":%d,\"connected\":%s,\"capabilities\":%s}",
                 seq, cached ? g_devices[i].device_id : addr_str,
                 cached ? g_devices[i].name : (g_devices[i].name[0] ? g_devices[i].name : "unknown"),
-                addr_str, g_devices[i].rssi,
+                addr_str, g_devices[i].rssi, ready ? "true" : "false",
                 g_devices[i].capabilities[0] ? g_devices[i].capabilities : "[]");
             ble_send_event_json(evt);
             if (cached) {
@@ -1178,18 +1386,26 @@ static void handle_ble_command(uint8_t seq, const uint8_t *payload, uint16_t pay
                 snprintf(hello, sizeof(hello),
                     "{\"type\":\"device_hello\",\"seq\":%d,"
                     "\"deviceId\":\"%s\",\"name\":\"%s\",\"room\":\"%s\","
-                    "\"address\":\"%s\",\"rssi\":%d,\"connected\":true,"
+                    "\"address\":\"%s\",\"rssi\":%d,\"connected\":%s,"
                     "\"capabilities\":%s,\"transport\":\"ble\",\"crypto\":\"sm4\",\"epoch\":0}",
                     seq, g_devices[i].device_id, g_devices[i].name,
-                    g_devices[i].room, addr_str, g_devices[i].rssi,
+                    g_devices[i].room, addr_str, g_devices[i].rssi, ready ? "true" : "false",
                     g_devices[i].capabilities[0] ? g_devices[i].capabilities : "[]");
                 ble_send_event_json(hello);
                 char st[300];
                 snprintf(st, sizeof(st),
                     "{\"type\":\"ble_device_state\",\"seq\":%d,\"deviceId\":\"%s\","
-                    "\"address\":\"%s\",\"connected\":true}",
-                    seq, g_devices[i].device_id, addr_str);
+                    "\"address\":\"%s\",\"connected\":%s}",
+                    seq, g_devices[i].device_id, addr_str, ready ? "true" : "false");
                 ble_send_event_json(st);
+                if (ready) {
+                    char ready_evt[320];
+                    snprintf(ready_evt, sizeof(ready_evt),
+                        "{\"type\":\"ble_ready\",\"seq\":%d,\"deviceId\":\"%s\","
+                        "\"address\":\"%s\",\"connected\":true,\"notifyReady\":true}",
+                        seq, g_devices[i].device_id, addr_str);
+                    ble_send_event_json(ready_evt);
+                }
             }
         }
 
@@ -1217,7 +1433,8 @@ static void handle_ble_command(uint8_t seq, const uint8_t *payload, uint16_t pay
                     didx = i; break;
                 }
             }
-            if (didx < 0 || g_devices[didx].conn_handle == 0xFFFF || g_devices[didx].business_cmd_handle == 0) {
+            if (didx < 0 || g_devices[didx].conn_handle == 0xFFFF ||
+                g_devices[didx].business_cmd_handle == 0 || !g_devices[didx].notify_ready) {
                 snprintf(result, sizeof(result), "{\"type\":\"ble_control_result\",\"seq\":%d,\"deviceId\":\"%s\",\"ok\":false,\"message\":\"device not connected\"}", seq, did_buf);
                 usb_send_json(TYPE_GATEWAY_BLE_EVT, seq, result);
             } else {
@@ -1240,7 +1457,8 @@ static void handle_ble_command(uint8_t seq, const uint8_t *payload, uint16_t pay
             "{\"type\":\"gateway_reboot_ack\",\"seq\":%d,\"ok\":true,\"delayMs\":500}", seq);
         /* 通过事件队列发送 ACK (确保 USB 帧编码+CRC+分片完成) */
         char *copy = strdup(ack);
-        if (copy && xQueueSend(g_evt_queue, &copy, pdMS_TO_TICKS(100)) == pdTRUE) {
+        evt_item_t item = { .data = copy, .len = copy ? (int)strlen(copy) : 0 };
+        if (copy && xQueueSend(g_evt_queue, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
             ESP_LOGI(TAG, "gateway_reboot_ack queued, restarting in 500ms");
             g_reboot_seq = seq;
             g_reboot_time = esp_timer_get_time() + 500000;
@@ -1286,6 +1504,12 @@ void app_main(void)
 
     /* BLE 事件队列: NimBLE 回调 → 主循环 USB 发送 */
     g_evt_queue = xQueueCreate(32, sizeof(evt_item_t));
+    g_usb_tx_mutex = xSemaphoreCreateMutex();
+    if (!g_evt_queue || !g_usb_tx_mutex) {
+        ESP_LOGE(TAG, "USB event transport init failed");
+        return;
+    }
+    xTaskCreate(usb_event_tx_task, "usb_evt_tx", 4096, NULL, 6, NULL);
 
     /* 启动 BLE Central */
     ble_central_init();
@@ -1326,15 +1550,8 @@ void app_main(void)
         }
 
         /* 消费 BLE 事件队列 (NimBLE 回调推送, 主循环发送) */
-        evt_item_t item;
-        while (xQueueReceive(g_evt_queue, &item, 0) == pdTRUE) {
-            usb_send_json(TYPE_GATEWAY_BLE_EVT, (uint8_t)g_scan_seq, item.data);
-            ESP_LOGI(TAG, "BLE EVT: %s", item.data);
-            free(item.data);
-        }
-
-        /* BLE 操作超时保护: busy 超过 40 秒强制结束 */
-        if (g_busy && (esp_timer_get_time() - g_busy_since) > 40000000) {
+        /* BLE operation timeout: two devices may need sequential discovery. */
+        if (g_busy && (esp_timer_get_time() - g_busy_since) > 90000000) {
             ESP_LOGE(TAG, "BLE operation timeout (90s), force finish");
             char evt[200];
             snprintf(evt, sizeof(evt),

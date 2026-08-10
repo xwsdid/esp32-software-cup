@@ -206,19 +206,14 @@ bool ble_bridge_on_command(const uint8_t *data, uint16_t len)
         char resp[400];
         snprintf(resp, sizeof(resp),
             "{\"type\":\"ble_key_exchange\",\"action\":\"public-key\","
-            "\"deviceId\":\"%s\",\"epoch\":%d,\"publicKeyBase64\":\"%s\"}",
-            s_device_id, epoch, pk_b64);
+            "\"epoch\":%d,\"publicKeyBase64\":\"%s\"}", epoch, pk_b64);
         send_notify_text(resp);
-
-        /* 延迟200ms 防网关连续Notify丢首帧 */
-        vTaskDelay(pdMS_TO_TICKS(200));
 
         ble_crypto_activate();
         g_ble_sensor_suppress_until = esp_timer_get_time() + 3000000;
         char ack[200];
         int alen = snprintf(ack, sizeof(ack),
-            "{\"type\":\"ack\",\"cmd\":\"key\",\"ok\":true,\"transport\":\"ble\","
-            "\"epoch\":%d,\"deviceId\":\"%s\"}", epoch, s_device_id);
+            "{\"type\":\"ack\",\"cmd\":\"key\",\"ok\":true,\"epoch\":%d}", epoch);
         if (ble_crypto_ready()) send_encrypted_ack(ack, alen, false);
         ESP_LOGI(TAG, "[BLE-ECDH] key exchange done epoch=%d", epoch);
         return true;

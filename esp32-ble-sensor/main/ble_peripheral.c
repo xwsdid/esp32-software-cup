@@ -108,48 +108,96 @@ static uint16_t s_notify_len[NOTIFY_QUEUE_MAX];
 static int s_notify_head = 0;  /* 下一条待发送 */
 static int s_notify_tail = 0;  /* 下一条可写入 */
 static struct ble_npl_callout s_notify_callout;
+static volatile bool s_notify_enabled = false;
+static portMUX_TYPE s_notify_lock = portMUX_INITIALIZER_UNLOCKED;
+
+#define NOTIFY_GAP_MS 120
+
+static void clear_notify_queue(void)
+{
+    portENTER_CRITICAL(&s_notify_lock);
+    s_notify_head = 0;
+    s_notify_tail = 0;
+    portEXIT_CRITICAL(&s_notify_lock);
+    ble_npl_callout_stop(&s_notify_callout);
+}
 
 static void deferred_notify_cb(struct ble_npl_event *ev)
 {
-    if (s_current_conn_handle == 0xFFFF || s_handle_device_event == 0) return;
+    if (s_current_conn_handle == 0xFFFF || s_handle_device_event == 0 || !s_notify_enabled) return;
 
-    while (s_notify_head != s_notify_tail) {
-        uint16_t len = s_notify_len[s_notify_head];
-        if (len == 0) { s_notify_head = (s_notify_head + 1) % NOTIFY_QUEUE_MAX; continue; }
-        struct os_mbuf *om = os_msys_get_pkthdr(len, 0);
-        if (!om) {
-            ESP_LOGE("BLE", "def-notify OOM (len=%u q[%d/%d]), retry 100ms",
-                     len, s_notify_head, s_notify_tail);
-            ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(100));
-            return;
+    int slot = -1;
+    uint16_t len = 0;
+    portENTER_CRITICAL(&s_notify_lock);
+    if (s_notify_head != s_notify_tail) {
+        slot = s_notify_head;
+        len = s_notify_len[slot];
+    }
+    portEXIT_CRITICAL(&s_notify_lock);
+
+    if (slot >= 0) {
+        if (len == 0) {
+            portENTER_CRITICAL(&s_notify_lock);
+            s_notify_head = (s_notify_head + 1) % NOTIFY_QUEUE_MAX;
+            portEXIT_CRITICAL(&s_notify_lock);
+        } else {
+            struct os_mbuf *om = os_msys_get_pkthdr(len, 0);
+            if (!om) {
+                ESP_LOGE("BLE", "def-notify OOM (len=%u q[%d/%d]), retry 100ms",
+                         len, s_notify_head, s_notify_tail);
+                ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(100));
+                return;
+            }
+            if (os_mbuf_append(om, s_notify_buf[slot], len) != 0) {
+                os_mbuf_free_chain(om);
+                ESP_LOGE("BLE", "def-notify mbuf_append fail, retry");
+                ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(100));
+                return;
+            }
+            int rc = ble_gattc_notify_custom(s_current_conn_handle, s_handle_device_event, om);
+            ESP_LOGI("BLE", "def-notify sent: len=%u rc=%d slot=%d", len, rc, slot);
+            portENTER_CRITICAL(&s_notify_lock);
+            s_notify_head = (s_notify_head + 1) % NOTIFY_QUEUE_MAX;
+            portEXIT_CRITICAL(&s_notify_lock);
         }
-        if (os_mbuf_append(om, s_notify_buf[s_notify_head], len) != 0) {
-            os_mbuf_free_chain(om);
-            ESP_LOGE("BLE", "def-notify mbuf_append fail, retry");
-            ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(100));
-            return;
-        }
-        int rc = ble_gattc_notify_custom(s_current_conn_handle, s_handle_device_event, om);
-        ESP_LOGI("BLE", "def-notify sent: len=%u rc=%d q[%d/%d]",
-                 len, rc, s_notify_head, s_notify_tail);
-        s_notify_head = (s_notify_head + 1) % NOTIFY_QUEUE_MAX;
+    }
+    portENTER_CRITICAL(&s_notify_lock);
+    bool has_more = s_notify_head != s_notify_tail;
+    portEXIT_CRITICAL(&s_notify_lock);
+    if (has_more) {
+        ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(NOTIFY_GAP_MS));
     }
 }
 
 void ble_notify_device_event(const uint8_t *data, uint16_t len)
 {
-    if (s_current_conn_handle == 0xFFFF || s_handle_device_event == 0) return;
+    if (s_current_conn_handle == 0xFFFF || s_handle_device_event == 0 || !s_notify_enabled) {
+        ESP_LOGW("BLE", "def-notify skipped: link/CCCD not ready len=%d", (int)len);
+        return;
+    }
+    uint16_t mtu = ble_att_mtu(s_current_conn_handle);
+    uint16_t max_payload = mtu > 3 ? mtu - 3 : 20;
+    if (len > max_payload) {
+        ESP_LOGE("BLE", "def-notify rejected: len=%u exceeds ATT payload=%u", len, max_payload);
+        return;
+    }
     if (len > sizeof(s_notify_buf[0])) return;
 
+    portENTER_CRITICAL(&s_notify_lock);
+    bool was_empty = s_notify_head == s_notify_tail;
     int next = (s_notify_tail + 1) % NOTIFY_QUEUE_MAX;
     if (next == s_notify_head) {
+        portEXIT_CRITICAL(&s_notify_lock);
         ESP_LOGW("BLE", "def-notify queue full! drop len=%d", (int)len);
         return;
     }
     memcpy(s_notify_buf[s_notify_tail], data, len);
     s_notify_len[s_notify_tail] = len;
     s_notify_tail = next;
-    ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(50));
+    portEXIT_CRITICAL(&s_notify_lock);
+    if (was_empty) {
+        ble_npl_callout_reset(&s_notify_callout, ble_npl_time_ms_to_ticks32(20));
+    }
 }
 
 bool ble_is_connected(void) { return s_current_conn_handle != 0xFFFF; }
@@ -245,6 +293,8 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            clear_notify_queue();
+            s_notify_enabled = false;
             s_current_conn_handle = event->connect.conn_handle;
             ESP_LOGI("BLE", "Connected: handle=%u (WiFi coexists)",
                      event->connect.conn_handle);
@@ -255,6 +305,8 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
+        clear_notify_queue();
+        s_notify_enabled = false;
         s_current_conn_handle = 0xFFFF;
         ESP_LOGI("BLE", "Disconnected: handle=%u reason=%u",
                  event->disconnect.conn.conn_handle, event->disconnect.reason);
@@ -268,6 +320,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
                           &adv, ble_gap_event_handler, NULL);
         return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.conn_handle == s_current_conn_handle) {
+            s_notify_enabled = event->subscribe.cur_notify != 0;
+            if (!s_notify_enabled) clear_notify_queue();
+        }
         ESP_LOGI("BLE", "Subscribe: conn=%u attr=%u notify=%u indicate=%u",
                  event->subscribe.conn_handle, event->subscribe.attr_handle,
                  event->subscribe.cur_notify, event->subscribe.cur_indicate);
@@ -342,6 +398,8 @@ static void ble_on_sync(void)
 {
     ble_npl_callout_init(&s_notify_callout, nimble_port_get_dflt_eventq(),
                           deferred_notify_cb, NULL);
+    int mtu_rc = ble_att_set_preferred_mtu(256);
+    if (mtu_rc != 0) ESP_LOGW("BLE", "set preferred MTU failed: rc=%d", mtu_rc);
     ESP_LOGI("BLE", "NimBLE host ready");
     if (ble_start_advertising() != 0) {
         ESP_LOGE("BLE", "Advertising start failed");
